@@ -105,15 +105,14 @@ flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
 flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
-# flags.DEFINE_integer(
-#     "num_gpus", 0,
-#     "Use the GPU backend if this value is set to more than zero.")
-
 flags.DEFINE_integer("steps_per_update", 1,
                      "The number of steps for accumulating gradients.")
 
 flags.DEFINE_integer("keep_checkpoint_max", 5,
                      "The maximum number of checkpoints to keep.")
+
+flags.DEFINE_string("cluster_mode", "local",
+                    "The mode for the Spark cluster. local, yarn or spark-submit.")
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps,
@@ -466,7 +465,16 @@ class CheckpointHook(tf.train.CheckpointSaverHook):
 
 def run(_):
   from bigdl.orca import init_orca_context
-  sc = init_orca_context()
+  cluster_mode = FLAGS.cluster_mode
+  if cluster_mode == "local":
+    init_orca_context(cluster_mode="local", cores="*", memory="100g")
+  elif cluster_mode.startswith("yarn"):
+    init_orca_context(cluster_mode=cluster_mode, num_nodes=20, cores=88, driver_memory="30g")
+  elif cluster_mode == "spark-submit":
+    init_orca_context(cluster_mode="spark-submit")
+  else:
+    print("init_orca_context failed. cluster_mode should be one of 'local', 'yarn' and \
+          'spark-submit' but got " + cluster_mode)
   num_workers = 2
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
   input_files = []
