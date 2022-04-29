@@ -114,6 +114,9 @@ flags.DEFINE_integer("keep_checkpoint_max", 5,
 flags.DEFINE_string("cluster_mode", "local",
                     "The mode for the Spark cluster. local, yarn or spark-submit.")
 
+flags.DEFINE_integer("num_executors", 10, "Total number of executors.")
+
+
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps,
                      use_one_hot_embeddings, optimizer, poly_power,
@@ -358,7 +361,9 @@ def input_fn_builder(input_files,
 
   def input_fn(params, input_context = None):
     """The actual input function."""
-
+    import os
+    import subprocess
+    os.environ["CLASSPATH"] = subprocess.check_output(["hadoop", "classpath", "--glob"]).decode()
     # batch_size = params["batch_size"]
     print(f"*******batch_size in input_fn is {batch_size}")
 
@@ -440,42 +445,52 @@ def _decode_record(record, name_to_features):
   return example
 
 
-class CheckpointHook(tf.train.CheckpointSaverHook):
-  """Add MLPerf logging to checkpoint saving."""
-
-  def __init__(self, num_train_steps, *args, **kwargs):
-    super(CheckpointHook, self).__init__(*args, **kwargs)
-    self.num_train_steps = num_train_steps
-    self.previous_step = None
-
-  def _save(self, session, step):
-    if self.previous_step:
-      mllog.mllog_end(key=mllog_constants.BLOCK_STOP,
-                      metadata={"first_step_num": self.previous_step + 1,
-                          "step_count": step - self.previous_step})
-    self.previous_step = step
-    mllog.mllog_start(key="checkpoint_start", metadata={"step_num" : step}) 
-    return_value = super(CheckpointHook, self)._save(session, step)
-    mllog.mllog_end(key="checkpoint_stop", metadata={"step_num" : step})
-    if step < self.num_train_steps:
-        mllog.mllog_start(key=mllog_constants.BLOCK_START,
-                          metadata={"first_step_num": step + 1})
-    return return_value
-
-
 def run(_):
   from bigdl.orca import init_orca_context
   cluster_mode = FLAGS.cluster_mode
   if cluster_mode == "local":
     init_orca_context(cluster_mode="local", cores="*", memory="100g")
+    num_workers = 1
   elif cluster_mode.startswith("yarn"):
-    init_orca_context(cluster_mode=cluster_mode, num_nodes=20, cores=88, driver_memory="30g")
+    num_executor = FLAGS.num_executors
+    executor_cores = 44
+    executor_memory = "20g"
+    driver_cores = 20
+    driver_memory = "10g"
+    spark_conf = {"spark.network.timeout": "10000000",
+                  "spark.sql.broadcastTimeout": "7200",
+                  "spark.sql.shuffle.partitions": "2000",
+                  "spark.locality.wait": "0s",
+                  "spark.sql.hive.filesourcePartitionFileCacheSize": "4096000000",
+                  "spark.sql.crossJoin.enabled": "true",
+                  "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+                  "spark.kryo.unsafe": "true",
+                  "spark.kryoserializer.buffer.max": "1024m",
+                  "spark.task.cpus": "1",
+                  "spark.executor.heartbeatInterval": "200s",
+                  "spark.driver.maxResultSize": "40G",
+                  "spark.eventLog.enabled": "true",
+                  "spark.eventLog.dir": "hdfs://172.16.0.105:8020/sparkHistoryLogs",
+                  "spark.executorEnv.LD_LIBRARY_PATH": "/opt/cloudera/parcels/CDH-5.15.2-1.cdh5.15.2.p0.3/lib64/:/usr/java/jdk1.8.0_181-amd64/jre/lib/amd64/server/",
+                  "spark.executorEnv.ARROW_LIBHDFS_DIR": "/opt/cloudera/parcels/CDH/lib64",
+                  "spark.shuffle.reduceLocality.enabled": "false",
+                  "spark.sql.autoBroadcastJoinThreshold":-1,
+                  "spark.app.name": f"bert-{num_executor}workers",
+                  "spark.executor.memoryOverhead": "120g"}
+    init_ray_on_spark = True
+    sc = init_orca_context("yarn-client", cores=executor_cores,
+                           num_nodes=num_executor, memory=executor_memory,
+                           driver_cores=driver_cores, driver_memory=driver_memory,
+                           penv_archive="hdfs:///yushan/env/tf1-py36.tar.gz",
+                           conf=spark_conf, object_store_memory="30g", init_ray_on_spark=init_ray_on_spark,include_webui=True,
+                           additional_archive="/home/shan/data/wiki_for_bert/tf1_ckpt.zip#ckpt",
+                           extra_python_lib="optimization.py,modeling.py,mlp_logging.py,deferred_grad_optimizer.py,lamb_optimizer_v1.py")
+    num_workers = num_executor
   elif cluster_mode == "spark-submit":
     init_orca_context(cluster_mode="spark-submit")
   else:
     print("init_orca_context failed. cluster_mode should be one of 'local', 'yarn' and \
           'spark-submit' but got " + cluster_mode)
-  num_workers = 2
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
@@ -540,32 +555,15 @@ def run(_):
                           model_dir=flag_dict["output_dir"],
                           config=config,
                           params=hparams,
-                          workers_per_node=num_workers,
+                          # workers_per_node=num_workers,
                           )
-
-  checkpoint_hook = CheckpointHook(
-    num_train_steps=flag_dict["num_train_steps"],
-    checkpoint_dir=flag_dict["output_dir"],
-    save_steps=flag_dict["save_checkpoints_steps"])
   train_spec=tf.estimator.TrainSpec(input_fn=train_input_fn, 
                                     max_steps=flag_dict["num_train_steps"],
-                                    hooks=[checkpoint_hook]
                                     )
   eval_spec=tf.estimator.EvalSpec(input_fn=eval_input_fn,
                                   steps=flag_dict["max_eval_steps"])
-  mllog.mlperf_submission_log()
-  mllog.mlperf_run_param_log()
-  mllog.mllog_end(key=mllog_constants.INIT_STOP)
-  mllog.mllog_start(key=mllog_constants.RUN_START)
-  results = estimator.train_and_evaluate(train_spec, eval_spec)
-  print(results)
-  mllog.mllog_end(key=mllog_constants.RUN_STOP)
-  # output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-  # with tf.gfile.GFile(output_eval_file, "w") as writer:
-  #   tf.logging.info("***** Eval results *****")
-  #   for key in sorted(result.keys()):
-  #     tf.logging.info("  %s = %s", key, str(result[key]))
-  #     writer.write("%s = %s\n" % (key, str(result[key])))
+  estimator.train_and_evaluate(train_spec, eval_spec)
+  print("Finished!")
 
 
 if __name__ == "__main__":
