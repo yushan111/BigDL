@@ -532,7 +532,7 @@ def run(_):
 
   config = dict(
     inter_op_parallelism=8,
-    log_step_count_steps=5,
+    log_step_count_steps=1,
     keep_checkpoint_max=flag_dict["keep_checkpoint_max"],
     save_checkpoints_steps=flag_dict["save_checkpoints_steps"],
   )
